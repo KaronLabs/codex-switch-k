@@ -1,0 +1,28 @@
+# Plain credentials and runtime trees
+auth.json
+auth.json.*
+credentials*
+secrets*
+.env
+.env.*
+.codex/
+codex-accounts/
+*.pem
+*.key
+# Account archives must never be committed
+backup/*
+backups/
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+*.backup
+# Local working material
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+*.log
+*.tmp
+.codex-tmp/
+.superpowers/

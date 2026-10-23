@@ -1,0 +1,10 @@
+* text=auto
+codex-switch text eol=lf
+codex-switch-admin-run text eol=lf
+*.bats text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
+*.yaml text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

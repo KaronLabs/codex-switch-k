@@ -1,0 +1,65 @@
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+readonly EX_USAGE=64
+readonly EX_NOPERM=77
+
+die() {
+    printf '%s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+safe_user_file() {
+    local path=$1 uid=$2
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    [[ "$(stat -c '%u:%a' -- "$path" 2>/dev/null)" == "$uid:600" ]]
+}
+
+safe_account_home() {
+    local path=$1 uid=$2
+    [[ -d "$path" && ! -L "$path" ]] || return 1
+    [[ "$(stat -c '%u:%a' -- "$path" 2>/dev/null)" == "$uid:700" ]]
+}
+
+[[ ${EUID} -eq 0 ]] || die 'Codex admin runner must be invoked through sudo' "$EX_NOPERM"
+[[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]] || die 'sudo caller identity is unavailable' "$EX_NOPERM"
+
+if [[ ${1:-} != __inside_private_mount_namespace ]]; then
+    exec /usr/bin/unshare --mount --fork --kill-child --propagation private \
+        "$0" __inside_private_mount_namespace "$@"
+fi
+shift
+
+[[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]] || \
+    die 'private mount namespace was not established' "$EX_NOPERM"
+(( $# >= 5 )) || die 'invalid Codex admin runner arguments' "$EX_USAGE"
+
+auth_source=$1
+auth_target=$2
+account_home=$3
+shift 3
+[[ ${1:-} == -- ]] || die 'invalid Codex admin runner separator' "$EX_USAGE"
+shift
+
+safe_user_file "$auth_source" "$SUDO_UID" || die 'selected account auth file is unsafe' "$EX_NOPERM"
+safe_user_file "$auth_target" "$SUDO_UID" || die 'shared auth target is unsafe' "$EX_NOPERM"
+safe_account_home "$account_home" "$SUDO_UID" || die 'selected account home is unsafe' "$EX_NOPERM"
+
+/usr/bin/mount --bind "$auth_source" "$auth_target"
+caller_record=$(getent passwd "$SUDO_UID")
+[[ -n "$caller_record" ]] || die 'sudo caller account is unavailable' "$EX_NOPERM"
+IFS=: read -r caller_name _ _ _ _ caller_home _ <<<"$caller_record"
+
+exec /usr/bin/setpriv \
+    --reuid="$SUDO_UID" \
+    --regid="$SUDO_GID" \
+    --init-groups \
+    /usr/bin/env \
+    HOME="$caller_home" \
+    USER="$caller_name" \
+    LOGNAME="$caller_name" \
+    CODEX_HOME="$(dirname "$auth_target")" \
+    CODEX_SWITCH_ACCOUNT_HOME="$account_home" \
+    "$@"

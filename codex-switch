@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+set -u
+
+umask 077
+
+ACCOUNT_ROOT=${CODEX_ACCOUNT_ROOT:-"$HOME/.local/share/codex-accounts"}
+SHARED_HOME=${CODEX_SHARED_HOME:-"$HOME/.codex"}
+CODEX_BIN=${CODEX_BIN:-"$HOME/.local/bin/codex"}
+BWRAP_BIN=${BWRAP_BIN:-/usr/bin/bwrap}
+SUDO_BIN=${SUDO_BIN:-/usr/bin/sudo}
+ADMIN_RUNNER_BIN=${ADMIN_RUNNER_BIN:-/usr/local/libexec/codex-switch-admin-run}
+PROC_ROOT=${CODEX_SWITCH_PROC_ROOT:-/proc}
+
+readonly EX_USAGE=64
+readonly EX_NOINPUT=66
+readonly EX_UNAVAILABLE=75
+readonly GATE_CANCELED=2
+readonly SLOT_ERROR='account number must be a positive integer without leading zeros'
+
+die() {
+    printf '%s\n' "$1" >&2
+    return "${2:-$EX_USAGE}"
+}
+
+valid_slot() {
+    [[ ${1:-} =~ ^[1-9][0-9]*$ ]]
+}
+
+slot_list() {
+    local path slot
+    [ ! -e "$ACCOUNT_ROOT" ] && [ ! -L "$ACCOUNT_ROOT" ] && return 0
+    safe_home "$ACCOUNT_ROOT" || return 1
+    for path in "$ACCOUNT_ROOT"/*; do
+        slot=${path##*/}
+        valid_slot "$slot" && printf '%s\n' "$slot"
+    done | sort -n
+}
+
+require_slot() {
+    local slot=$1
+    valid_slot "$slot" || { die "$SLOT_ERROR" "$EX_USAGE"; return $?; }
+    if [ ! -e "$ACCOUNT_ROOT/$slot" ] && [ ! -L "$ACCOUNT_ROOT/$slot" ]; then
+        die "slot $slot does not exist; run codex-switch add $slot" "$EX_NOINPUT"
+        return $?
+    fi
+}
+
+require_file_auth_allowed() {
+    python3 - <<'PY'
+import pathlib
+import sys
+import tomllib
+
+for path in (pathlib.Path('/etc/codex/requirements.toml'),
+             pathlib.Path('/etc/codex/managed_config.toml')):
+    try:
+        with path.open('rb') as stream:
+            policy = tomllib.load(stream)
+    except FileNotFoundError:
+        continue
+    except (OSError, tomllib.TOMLDecodeError):
+        print('unable to inspect managed Codex authentication policy', file=sys.stderr)
+        sys.exit(1)
+    if policy.get('cli_auth_credentials_store', 'file') != 'file':
+        print('managed Codex policy prevents file-based slot authentication', file=sys.stderr)
+        sys.exit(1)
+PY
+}
+
+account_home() {
+    printf '%s/%s/home\n' "$ACCOUNT_ROOT" "$1"
+}
+
+account_auth() {
+    printf '%s/%s/auth.json\n' "$ACCOUNT_ROOT" "$1"
+}
+
+reject_symlink_components() {
+    local path=$1 current part
+    case "$path" in
+        /*) current=/ ;;
+        *) path=$PWD/$path; current=/ ;;
+    esac
+    IFS=/ read -r -a parts <<<"${path#/}"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        if [ "$current" = / ]; then
+            current="/$part"
+        else
+            current="$current/$part"
+        fi
+        [ ! -L "$current" ] || return 1
+    done
+    return 0
+}
+
+safe_home() {
+    [ -d "$1" ] &&
+        [ ! -L "$1" ] &&
+        reject_symlink_components "$1" &&
+        [ "$(stat -c '%u:%a' -- "$1" 2>/dev/null)" = "$(id -u):700" ]
+}
+
+safe_auth() {
+    [ -f "$1" ] &&
+        [ ! -L "$1" ] &&
+        reject_symlink_components "$1" &&
+        [ "$(stat -c '%u:%a' -- "$1" 2>/dev/null)" = "$(id -u):600" ]
+}
+
+validate_auth() {
+    safe_auth "$1" || return 1
+    jq -e '
+        type == "object" and
+        (.auth_mode == "chatgpt") and
+        (.tokens | type == "object") and
+        (.tokens.access_token | type == "string" and length > 0) and
+        (.tokens.refresh_token | type == "string" and length > 0) and
+        (.tokens.id_token | type == "string" and length > 0) and
+        (.tokens.account_id | type == "string" and length > 0)
+    ' "$1" >/dev/null 2>&1
+}
+
+account_is_unique() {
+    local slot=$1 auth current_id other other_auth other_id slots
+    auth=$(account_auth "$slot")
+    validate_auth "$auth" || return 1
+    current_id=$(jq -r '.tokens.account_id' "$auth") || return 1
+    slots=$(slot_list) || return 1
+    while IFS= read -r other; do
+        [ -n "$other" ] || continue
+        [ "$other" = "$slot" ] && continue
+        other_auth=$(account_auth "$other")
+        validate_auth "$other_auth" || continue
+        other_id=$(jq -r '.tokens.account_id' "$other_auth") || return 1
+        [ "$other_id" != "$current_id" ] || return 1
+    done <<<"$slots"
+    return 0
+}
+
+label_for() {
+    python3 - "$1" <<'PY'
+import base64
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        auth = json.load(stream)
+    tokens = auth.get("tokens") or {}
+    token = tokens.get("id_token", "")
+    account_id = tokens.get("account_id", "")
+    email = ""
+    parts = token.split(".")
+    if len(parts) == 3:
+        payload = parts[1] + ("=" * (-len(parts[1]) % 4))
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        email = claims.get("email", "")
+    if email and account_id:
+        print(f"{email} ({account_id[:8]}...)")
+    elif email:
+        print(email)
+    else:
+        print("email unavailable")
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    print("email unavailable")
+PY
+}
+
+add_account() {
+    local slot=$1 home auth
+    valid_slot "$slot" || { die "$SLOT_ERROR" "$EX_USAGE"; return $?; }
+    home=$(account_home "$slot")
+    auth=$(account_auth "$slot")
+    if [ -e "$ACCOUNT_ROOT/$slot" ] || [ -L "$ACCOUNT_ROOT/$slot" ]; then
+        die 'slot already exists or is unsafe' "$EX_UNAVAILABLE"; return $?;
+    fi
+    { reject_symlink_components "$ACCOUNT_ROOT" && reject_symlink_components "$SHARED_HOME"; } || {
+        die 'account or shared home path is unsafe' "$EX_UNAVAILABLE"; return $?;
+    }
+    if [ ! -e "$ACCOUNT_ROOT" ]; then
+        mkdir -p -- "$ACCOUNT_ROOT" || return "$EX_UNAVAILABLE"
+    fi
+    safe_home "$ACCOUNT_ROOT" || {
+        die 'account root is unsafe' "$EX_UNAVAILABLE"; return $?;
+    }
+    if [ ! -e "$SHARED_HOME" ]; then
+        mkdir -p -- "$SHARED_HOME" || return "$EX_UNAVAILABLE"
+    fi
+    safe_home "$SHARED_HOME" || {
+        die 'shared Codex home is unsafe' "$EX_UNAVAILABLE"; return $?;
+    }
+    if [ ! -e "$SHARED_HOME/auth.json" ] && [ ! -L "$SHARED_HOME/auth.json" ]; then
+        (set -C; : >"$SHARED_HOME/auth.json") || return "$EX_UNAVAILABLE"
+    fi
+    safe_auth "$SHARED_HOME/auth.json" || {
+        die 'shared auth mount target is unsafe' "$EX_UNAVAILABLE"; return $?;
+    }
+    mkdir -m 700 -- "$ACCOUNT_ROOT/$slot" || return "$EX_UNAVAILABLE"
+    mkdir -m 700 -- "$home" || return "$EX_UNAVAILABLE"
+    (set -C; : >"$auth") || return "$EX_UNAVAILABLE"
+    safe_auth "$auth" || return "$EX_UNAVAILABLE"
+}
+
+verify_account_home() {
+    local slot=$1 home
+    home=$(account_home "$slot")
+    if ! { safe_home "$ACCOUNT_ROOT" && safe_home "$ACCOUNT_ROOT/$slot" && safe_home "$home"; }; then
+        die 'account home is missing or unsafe' "$EX_UNAVAILABLE"
+        return $?
+    fi
+    [ -z "$(find "$home" -mindepth 1 -maxdepth 1 -print -quit)" ] || {
+        die 'account mountpoint is not empty' "$EX_UNAVAILABLE"; return $?;
+    }
+    if ! { [ -d "$SHARED_HOME" ] && [ ! -L "$SHARED_HOME" ] && reject_symlink_components "$SHARED_HOME"; }; then
+        die 'shared Codex home is missing or unsafe' "$EX_UNAVAILABLE"
+        return $?
+    fi
+    safe_auth "$SHARED_HOME/auth.json" || {
+        die 'shared legacy auth mount target is missing or unsafe' "$EX_UNAVAILABLE"; return $?;
+    }
+}
+
+run_in_account_view() {
+    local slot=$1 home auth
+    shift
+    home=$(account_home "$slot")
+    auth=$(account_auth "$slot")
+    [ -x "$BWRAP_BIN" ] || { die 'Bubblewrap executable is missing' "$EX_NOINPUT"; return $?; }
+    "$BWRAP_BIN" \
+        --die-with-parent \
+        --bind / / \
+        --dev-bind /dev /dev \
+        --bind "$auth" "$SHARED_HOME/auth.json" \
+        --setenv CODEX_HOME "$SHARED_HOME" \
+        --setenv CODEX_SWITCH_ACCOUNT_HOME "$home" \
+        --chdir "$PWD" \
+        "$CODEX_BIN" "$@"
+}
+
+run_in_sudo_account_view() {
+    local slot=$1 home auth
+    shift
+    home=$(account_home "$slot")
+    auth=$(account_auth "$slot")
+    [ -x "$SUDO_BIN" ] || { die 'sudo executable is missing' "$EX_NOINPUT"; return $?; }
+    [ -x "$ADMIN_RUNNER_BIN" ] || { die 'Codex admin runner is missing' "$EX_NOINPUT"; return $?; }
+    exec "$SUDO_BIN" -n "$ADMIN_RUNNER_BIN" \
+        "$auth" "$SHARED_HOME/auth.json" "$home" -- "$CODEX_BIN" "$@"
+}
+
+codex_sessions() {
+    local checker=${CODEX_SWITCH_PROCESS_CHECK:-${CODEX_PROCESS_DETECTOR:-}} output rc
+    if [ -n "$checker" ]; then
+        if [ -x "$checker" ]; then
+            output=$("$checker" 2>/dev/null)
+            rc=$?
+        else
+            output=$(bash -c "$checker" 2>/dev/null)
+            rc=$?
+        fi
+        [ "$rc" -eq 1 ] && return 1
+        [ "$rc" -eq 0 ] || return 2
+        printf '%s\n' "$output" |
+            awk -F '\t' '
+                NF == 5 && $1 ~ /^[0-9]+$/ &&
+                $2 ~ /^(cli|app-server|desktop-proxy)$/ &&
+                $5 ~ /^[0-9]+(,[0-9]+)*$/ {
+                    print
+                    found = 1
+                }
+                END { exit(found ? 0 : 2) }
+            '
+        return $?
+    fi
+
+    CODEX_SWITCH_PROC_ROOT="$PROC_ROOT" CODEX_BIN="$CODEX_BIN" CODEX_SHARED_HOME="$SHARED_HOME" python3 - 2>/dev/null <<'PY'
+import base64
+import hashlib
+import json
+import os
+import socket
+import stat as stat_module
+import struct
+import time
+from pathlib import Path
+
+root = Path(os.environ["CODEX_SWITCH_PROC_ROOT"])
+codex_bin = os.environ["CODEX_BIN"]
+shared_home = Path(os.environ["CODEX_SHARED_HOME"])
+uid = os.getuid()
+
+if not root.is_dir():
+    raise SystemExit(2)
+
+def read_text(path):
+    return path.read_text(encoding="utf-8", errors="replace").strip()
+
+def read_process(directory):
+    try:
+        status = {}
+        for line in read_text(directory / "status").splitlines():
+            if ":" in line:
+                key, value = line.split(":", 1)
+                status[key] = value.strip()
+        if int(status["Uid"].split()[0]) != uid:
+            return None
+        stat = read_text(directory / "stat")
+        rest = stat[stat.rfind(")") + 2:].split()
+        ppid = int(rest[1])
+        pgid = int(rest[2])
+        sid = int(rest[3])
+        start_ticks = int(rest[19])
+        comm = read_text(directory / "comm")
+        argv = (directory / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+        argv = [item.decode("utf-8", "replace") for item in argv if item]
+        environ = (directory / "environ").read_bytes().split(b"\0")
+        codex_home = ""
+        account_home = ""
+        for item in environ:
+            if item.startswith(b"CODEX_HOME="):
+                codex_home = item.split(b"=", 1)[1].decode("utf-8", "replace")
+            elif item.startswith(b"CODEX_SWITCH_ACCOUNT_HOME="):
+                account_home = item.split(b"=", 1)[1].decode("utf-8", "replace")
+        tty_file = directory / "tty"
+        if tty_file.is_file():
+            tty = read_text(tty_file) or "?"
+        else:
+            try:
+                target = os.readlink(directory / "fd" / "0")
+                tty = target.removeprefix("/dev/") if target.startswith("/dev/pts/") else "?"
+            except OSError:
+                tty = "?"
+        try:
+            exe = os.readlink(directory / "exe") if (directory / "exe").is_symlink() else ""
+        except OSError:
+            exe = ""
+        return {
+            "pid": int(directory.name),
+            "uid": int(status["Uid"].split()[0]),
+            "ppid": ppid,
+            "pgid": pgid,
+            "sid": sid,
+            "start_ticks": start_ticks,
+            "comm": comm,
+            "argv": argv,
+            "exe": exe,
+            "home": account_home or codex_home,
+            "tty": tty,
+        }
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+def managed_record(name):
+    try:
+        path = shared_home / "app-server-daemon" / f"{name}.pid"
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW), "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_size > 16384:
+                return None
+            payload = stream.read(16385)
+            if len(payload) > 16384:
+                return None
+        record = json.loads(payload)
+        identity = record["processIdentity"]
+        if (type(record["pid"]) is int and record["pid"] > 1
+                and type(identity["bootId"]) is str
+                and type(identity["startTicks"]) is int):
+            return record
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+        pass
+    return None
+
+def managed_identity(process, record):
+    if not record or process["pid"] != record["pid"] or process["uid"] != uid:
+        return False
+    try:
+        release_parts = Path(process["exe"]).relative_to(
+            shared_home / "packages" / "app-server-daemon" / "releases"
+        ).parts
+        boot_id = read_text(root / "sys" / "kernel" / "random" / "boot_id")
+    except (ValueError, OSError):
+        return False
+    return (len(release_parts) == 3 and release_parts[1:] == ("bin", "codex")
+            and len(process["argv"]) >= 2 and process["argv"][1] == "app-server"
+            and boot_id == record["processIdentity"]["bootId"]
+            and process["start_ticks"] == record["processIdentity"]["startTicks"])
+
+def managed_identity_still_matches(process, name, record):
+    current = read_process(root / str(process["pid"]))
+    return (managed_record(name) == record and current is not None
+            and managed_identity(current, record)
+            and current["start_ticks"] == process["start_ticks"])
+
+def loaded_threads_idle(daemon_pid):
+    deadline = time.monotonic() + 2.0
+    control = shared_home / "app-server-control" / "app-server-control.sock"
+    with socket.socket(socket.AF_UNIX) as connection:
+        def remaining():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError
+            connection.settimeout(seconds)
+
+        def receive_exact(count):
+            data = bytearray()
+            while len(data) < count:
+                remaining()
+                chunk = connection.recv(count - len(data))
+                if not chunk:
+                    raise EOFError
+                data.extend(chunk)
+            return bytes(data)
+
+        def send_frame(payload, opcode=1):
+            mask = os.urandom(4)
+            size = len(payload)
+            header = bytearray([0x80 | opcode])
+            if size < 126:
+                header.append(0x80 | size)
+            elif size < 65536:
+                header.extend((0x80 | 126,))
+                header.extend(size.to_bytes(2, "big"))
+            else:
+                header.extend((0x80 | 127,))
+                header.extend(size.to_bytes(8, "big"))
+            remaining()
+            connection.sendall(bytes(header) + mask + bytes(
+                byte ^ mask[index % 4] for index, byte in enumerate(payload)
+            ))
+
+        def receive_message():
+            while True:
+                first, second = receive_exact(2)
+                if first & 0x80 == 0 or first & 0x70 or second & 0x80:
+                    raise ValueError("invalid WebSocket frame")
+                size = second & 0x7F
+                if size == 126:
+                    size = int.from_bytes(receive_exact(2), "big")
+                elif size == 127:
+                    size = int.from_bytes(receive_exact(8), "big")
+                if size > 1024 * 1024:
+                    raise ValueError("oversized WebSocket frame")
+                payload = receive_exact(size)
+                opcode = first & 0x0F
+                if opcode == 9:
+                    send_frame(payload, 10)
+                    continue
+                if opcode == 10:
+                    continue
+                if opcode != 1:
+                    raise ValueError("unexpected WebSocket frame")
+                return json.loads(payload.decode("utf-8"))
+
+        request_id = 0
+        def rpc(method, params=None):
+            nonlocal request_id
+            request_id += 1
+            request = {"id": request_id, "method": method}
+            if params is not None:
+                request["params"] = params
+            send_frame(json.dumps(request, separators=(",", ":")).encode())
+            while True:
+                response = receive_message()
+                if not isinstance(response, dict):
+                    raise ValueError("invalid RPC response")
+                if type(response.get("id")) is int and response["id"] == request_id:
+                    if "error" in response or "result" not in response:
+                        raise ValueError("RPC failed")
+                    return response["result"]
+                if "id" in response:
+                    raise ValueError("unexpected RPC response")
+
+        remaining()
+        connection.connect(str(control))
+        peer_pid, peer_uid, _ = struct.unpack(
+            "3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                        struct.calcsize("3i")))
+        if peer_pid != daemon_pid or peer_uid != uid:
+            return False
+        key = base64.b64encode(os.urandom(16)).decode()
+        handshake = (
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode()
+        remaining()
+        connection.sendall(handshake)
+        header = bytearray()
+        while not header.endswith(b"\r\n\r\n"):
+            if len(header) >= 8192:
+                raise ValueError("oversized WebSocket handshake")
+            header.extend(receive_exact(1))
+        lines = header.decode("ascii").split("\r\n")
+        fields = dict(line.split(":", 1) for line in lines[1:] if ":" in line)
+        fields = {name.lower(): value.strip() for name, value in fields.items()}
+        accept = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+        ).digest()).decode()
+        if (not lines[0].startswith("HTTP/1.1 101 ")
+                or fields.get("sec-websocket-accept") != accept
+                or fields.get("upgrade", "").lower() != "websocket"
+                or "upgrade" not in fields.get("connection", "").lower()):
+            raise ValueError("invalid WebSocket handshake")
+
+        initialized = rpc("initialize", {"clientInfo": {"name": "codex-switch", "version": "1"}})
+        required = ("codexHome", "platformFamily", "platformOs", "userAgent")
+        if (not isinstance(initialized, dict)
+                or any(not isinstance(initialized.get(field), str) or not initialized[field]
+                       for field in required)
+                or not os.path.isabs(initialized["codexHome"])):
+            raise ValueError("invalid initialize response")
+        send_frame(b'{"method":"initialized"}')
+        cursor = None
+        seen_cursors = set()
+        while True:
+            result = rpc("thread/loaded/list", {} if cursor is None else {"cursor": cursor})
+            if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise ValueError("invalid loaded thread list")
+            for thread_id in result["data"]:
+                if not isinstance(thread_id, str) or not thread_id:
+                    raise ValueError("invalid thread id")
+                thread = rpc("thread/read", {"threadId": thread_id, "includeTurns": False})
+                if (not isinstance(thread, dict)
+                        or not isinstance(thread.get("thread"), dict)
+                        or thread["thread"].get("id") != thread_id
+                        or not isinstance(thread["thread"].get("status"), dict)
+                        or thread["thread"]["status"].get("type") != "idle"):
+                    return False
+            cursor = result.get("nextCursor")
+            if cursor is None:
+                return True
+            if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                raise ValueError("invalid thread cursor")
+            seen_cursors.add(cursor)
+
+records = {name: managed_record(name) for name in ("daemon", "daemon-updater")}
+processes = {}
+for directory in root.iterdir():
+    if not directory.name.isdigit() or not directory.is_dir():
+        continue
+    process = read_process(directory)
+    if process is not None:
+        processes[process["pid"]] = process
+
+if any(record["pid"] not in processes and (root / str(record["pid"])).is_dir()
+       for record in records.values() if record):
+    raise SystemExit(2)
+
+managed_pids = set()
+daemon = records["daemon"]
+updater = records["daemon-updater"]
+record_conflict = bool(daemon and updater and daemon["pid"] == updater["pid"])
+if not record_conflict and updater and updater["pid"] in processes:
+    process = processes[updater["pid"]]
+    if (managed_identity(process, updater)
+            and managed_identity_still_matches(process, "daemon-updater", updater)):
+        managed_pids.add(process["pid"])
+if not record_conflict and daemon and daemon["pid"] in processes:
+    process = processes[daemon["pid"]]
+    if managed_identity(process, daemon):
+        try:
+            idle = loaded_threads_idle(process["pid"])
+        except Exception:
+            idle = False
+        if idle and managed_identity_still_matches(process, "daemon", daemon):
+            managed_pids.add(process["pid"])
+
+def is_codex(process):
+    if process["comm"] in {"codex", "codex-code-mode"}:
+        return True
+    argv = process["argv"]
+    return (
+        process["comm"] == "MainThread"
+        and len(argv) >= 2
+        and os.path.basename(argv[0]) in {"node", "nodejs"}
+        and (argv[1] == codex_bin or os.path.basename(argv[1]) == "codex")
+    )
+
+def kind_for(process):
+    argv = process["argv"]
+    for index in range(len(argv) - 1):
+        if argv[index:index + 2] == ["app-server", "proxy"]:
+            return "desktop-proxy"
+    if "app-server" in argv:
+        return "app-server"
+    return "cli"
+
+rank = {"cli": 0, "app-server": 1, "desktop-proxy": 2}
+groups = {}
+exempt_pgids = {processes[pid]["pgid"] for pid in managed_pids}
+for process in processes.values():
+    if process["pid"] in managed_pids:
+        continue
+    if not is_codex(process):
+        continue
+    pgid = process["pgid"]
+    if pgid <= 1:
+        continue
+    group = groups.setdefault(
+        pgid,
+        {"kind": "cli", "tty": "?", "homes": set(), "pids": set(),
+         "exempt": pgid in exempt_pgids},
+    )
+    kind = kind_for(process)
+    if rank[kind] > rank[group["kind"]]:
+        group["kind"] = kind
+    if process["tty"] != "?":
+        group["tty"] = process["tty"]
+    group["homes"].add(process["home"] or "<unset>")
+    group["pids"].add(process["pid"])
+
+    parent = process["ppid"]
+    seen = set()
+    while parent > 1 and parent not in seen:
+        seen.add(parent)
+        ancestor = processes.get(parent)
+        if ancestor is None or ancestor["pgid"] != pgid:
+            break
+        if parent in managed_pids:
+            break
+        if ancestor["comm"] in {"sshd", "sftp-server"}:
+            break
+        group["pids"].add(parent)
+        parent = ancestor["ppid"]
+
+if not groups:
+    raise SystemExit(3)
+
+for pgid in sorted(groups):
+    group = groups[pgid]
+    homes = group["homes"]
+    home = "<unset>" if not homes else next(iter(homes)) if len(homes) == 1 else "<mixed>"
+    safe_home = home.replace("\t", "").replace("\n", "")
+    pids = ",".join(str(pid) for pid in sorted(group["pids"]))
+    print(f"{pgid}\t{group['kind']}\t{group['tty']}\t{safe_home}\t{pids}\t{int(group['exempt'])}")
+PY
+    rc=$?
+    [ "$rc" -eq 3 ] && return 1
+    [ "$rc" -eq 0 ] && return 0
+    return 2
+}
+
+session_account() {
+    local home=$1 slot account slots
+    slots=$(slot_list) || return 1
+    while IFS= read -r slot; do
+        [ -n "$slot" ] || continue
+        account=$(account_home "$slot")
+        [ "$home" = "$account" ] && { printf '%s\n' "$slot"; return 0; }
+    done <<<"$slots"
+    case "$home" in
+        ''|'<unset>'|"$SHARED_HOME"|"$HOME/.codex") printf '%s\n' 'legacy/default' ;;
+        *) printf '%s\n' 'external' ;;
+    esac
+}
+
+format_sessions() {
+    local pgid kind tty home pids account
+    while IFS=$'\t' read -r pgid kind tty home pids _; do
+        [ -n "$pgid" ] || continue
+        account=$(session_account "$home")
+        printf 'session=%s kind=%s tty=%s account=%s pids=%s\n' "$pgid" "$kind" "$tty" "$account" "$pids"
+    done
+}
+
+home_is_running() {
+    local sessions=$1 home=$2
+    printf '%s\n' "$sessions" | awk -F '\t' -v home="$home" '$4 == home { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+sessions_only_for_home() {
+    local sessions=$1 target_home=$2 pgid kind tty home pids found=0
+    while IFS=$'\t' read -r pgid kind tty home pids; do
+        [ -n "$pgid" ] || continue
+        found=1
+        [ "$kind" = cli ] || return 1
+        [ "$home" = "$target_home" ] || return 1
+    done <<<"$sessions"
+    [ "$found" -eq 1 ]
+}
+
+legacy_is_running() {
+    local sessions=$1 pgid kind tty home pids account
+    while IFS=$'\t' read -r pgid kind tty home pids; do
+        [ -n "$pgid" ] || continue
+        account=$(session_account "$home")
+        [ "$account" = 'legacy/default' ] && return 0
+    done <<<"$sessions"
+    return 1
+}
+
+list_accounts() {
+    local slot home auth label suffix sessions sessions_rc slots
+    slots=$(slot_list) || { die 'account root is unsafe' "$EX_UNAVAILABLE"; return $?; }
+    sessions=$(codex_sessions)
+    sessions_rc=$?
+    [ "$sessions_rc" -eq 1 ] && sessions=
+    if [ "$sessions_rc" -gt 1 ]; then
+        die 'unable to inspect running Codex processes' "$EX_UNAVAILABLE"
+        return $?
+    fi
+    while IFS= read -r slot; do
+        [ -n "$slot" ] || continue
+        home=$(account_home "$slot")
+        auth=$(account_auth "$slot")
+        suffix=
+        if home_is_running "$sessions" "$home"; then
+            if [ -t 1 ]; then
+                suffix=$' \033[1;92m(running)\033[0m'
+            else
+                suffix=' (running)'
+            fi
+        fi
+        if verify_account_home "$slot" >/dev/null 2>&1 && validate_auth "$auth"; then
+            label=$(label_for "$auth")
+            if account_is_unique "$slot"; then
+                printf 'account %s: %s [ready]%s\n' "$slot" "$label" "$suffix"
+            else
+                printf 'account %s: %s [duplicate account]%s\n' "$slot" "$label" "$suffix"
+            fi
+        elif verify_account_home "$slot" >/dev/null 2>&1; then
+            printf 'account %s: (login required)%s\n' "$slot" "$suffix"
+        else
+            printf 'account %s: (home invalid)%s\n' "$slot" "$suffix"
+        fi
+    done <<<"$slots"
+    legacy_is_running "$sessions" && printf '%s\n' 'legacy/default Codex: running'
+    return 0
+}
+
+session_pgid_present() {
+    local pgid=$1 sessions
+    sessions=$(codex_sessions 2>/dev/null) || return 1
+    printf '%s\n' "$sessions" | awk -F '\t' -v pgid="$pgid" '$1 == pgid { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+signal_sessions() {
+    local signal=$1 sessions=$2 pgid pid current_pgid fresh
+    local fresh_pgid fresh_pids
+    local -a target_pids
+    current_pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')
+    while IFS=$'\t' read -r pgid _; do
+        [[ "$pgid" =~ ^[0-9]+$ ]] || continue
+        [ "$pgid" = "$current_pgid" ] && continue
+        fresh=$(codex_sessions 2>/dev/null) || continue
+        while IFS=$'\t' read -r fresh_pgid _ _ _ fresh_pids _; do
+            [ "$fresh_pgid" = "$pgid" ] || continue
+            IFS=, read -r -a target_pids <<<"$fresh_pids"
+            for pid in "${target_pids[@]}"; do
+                if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                    kill "-$signal" -- "$pid" 2>/dev/null || true
+                fi
+            done
+        done <<<"$fresh"
+    done <<<"$sessions"
+}
+
+wait_for_initial_sessions() {
+    local sessions=$1 pgid kind tty home pids alive
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        alive=0
+        while IFS=$'\t' read -r pgid kind tty home pids; do
+            [ -n "$pgid" ] || continue
+            session_pgid_present "$pgid" && alive=1
+        done <<<"$sessions"
+        [ "$alive" -eq 0 ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_for_quiet_window() {
+    local current rc
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        current=$(codex_sessions 2>/dev/null)
+        rc=$?
+        [ "$rc" -eq 0 ] && return 1
+        [ "$rc" -gt 1 ] && return 2
+        sleep 0.1
+    done
+    return 0
+}
+
+terminate_blockers() {
+    local blockers=$1 remaining rc
+    signal_sessions TERM "$blockers"
+    if ! wait_for_initial_sessions "$blockers"; then
+        signal_sessions KILL "$blockers"
+        if ! wait_for_initial_sessions "$blockers"; then
+            printf '%s\n' 'Codex process group could not be terminated; launch aborted' >&2
+            return "$EX_UNAVAILABLE"
+        fi
+    fi
+    wait_for_quiet_window
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '%s\n' 'Codex process(es) respawned; launch aborted' >&2
+        if remaining=$(codex_sessions 2>/dev/null); then
+            printf '%s\n' "$remaining" | format_sessions >&2
+        fi
+        return "$EX_UNAVAILABLE"
+    fi
+    return 0
+}
+
+process_gate() {
+    local force_kill=$1 target_home=$2 blockers answer rc
+    blockers=$(codex_sessions)
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$rc" -gt 1 ]; then
+        die 'unable to inspect running Codex processes' "$EX_UNAVAILABLE"
+        return $?
+    fi
+    if [ "$force_kill" -eq 0 ] && sessions_only_for_home "$blockers" "$target_home"; then
+        return 0
+    fi
+    printf '%s\n' 'Codex process(es) are running:' >&2
+    printf '%s\n' "$blockers" | format_sessions >&2
+    if [ "$force_kill" -eq 1 ]; then
+        terminate_blockers "$blockers"
+        return $?
+    fi
+    if [ ! -t 0 ]; then
+        die 'running Codex process(es) detected; use --kill or close them first' "$EX_UNAVAILABLE"
+        return $?
+    fi
+    printf '%s' 'Kill running Codex process(es)? [Y/n]: ' >&2
+    IFS= read -r answer || answer=
+    case "$answer" in
+        ''|y|Y)
+            terminate_blockers "$blockers"
+            ;;
+        *)
+            printf '%s\n' 'Launch canceled; running Codex process(es) were not killed' >&2
+            return "$GATE_CANCELED"
+            ;;
+    esac
+}
+
+login_account() {
+    local slot=$1 method=${2:-device}
+    require_slot "$slot" || return $?
+    verify_account_home "$slot" || return $?
+    safe_auth "$(account_auth "$slot")" || { die 'account auth file is missing or unsafe' "$EX_UNAVAILABLE"; return $?; }
+    require_file_auth_allowed || return "$EX_UNAVAILABLE"
+    [ -x "$CODEX_BIN" ] || { die 'Codex executable is missing' "$EX_NOINPUT"; return $?; }
+    if [ "$method" = browser ]; then
+        run_in_account_view "$slot" -c cli_auth_credentials_store=file login || return $?
+    else
+        run_in_account_view "$slot" -c cli_auth_credentials_store=file login --device-auth || return $?
+    fi
+    validate_auth "$(account_auth "$slot")" || { die 'file-based slot login was not created' "$EX_UNAVAILABLE"; return $?; }
+    account_is_unique "$slot" || { die 'account login duplicates another slot' "$EX_UNAVAILABLE"; return $?; }
+}
+
+launch_account() {
+    local slot=$1 force_kill=0 home auth rc
+    shift
+    require_slot "$slot" || return $?
+    if [ "${1:-}" = --kill ]; then
+        force_kill=1
+        shift
+    fi
+    [ "${1:-}" = -- ] && shift
+    [ -x "$CODEX_BIN" ] || { die 'Codex executable is missing' "$EX_NOINPUT"; return $?; }
+    verify_account_home "$slot" || return $?
+    home=$(account_home "$slot")
+    auth=$(account_auth "$slot")
+    validate_auth "$auth" || { die 'account login is missing or invalid' "$EX_NOINPUT"; return $?; }
+    account_is_unique "$slot" || { die 'account login duplicates another slot' "$EX_UNAVAILABLE"; return $?; }
+    require_file_auth_allowed || return "$EX_UNAVAILABLE"
+    process_gate "$force_kill" "$home"
+    rc=$?
+    [ "$rc" -eq "$GATE_CANCELED" ] && return 0
+    [ "$rc" -eq 0 ] || return "$rc"
+    run_in_sudo_account_view "$slot" --no-daemon -c cli_auth_credentials_store=file "$@"
+}
+
+menu() {
+    local choice
+    if ! [ -t 0 ] || ! [ -t 1 ]; then
+        die 'interactive menu requires a TTY' "$EX_USAGE"
+        return $?
+    fi
+    while :; do
+        printf '%s\n' 'Codex accounts:'
+        list_accounts
+        printf '%s\n' '0) exit'
+        printf '%s' 'Select account: '
+        IFS= read -r choice || return 0
+        [ "$choice" = 0 ] && return 0
+        if valid_slot "$choice"; then
+            launch_account "$choice"
+        else
+            printf '%s\n' 'invalid selection' >&2
+        fi
+    done
+}
+
+main() {
+    local command=${1:-}
+    case "$command" in
+        list)
+            [ "$#" -eq 1 ] || return "$EX_USAGE"
+            list_accounts
+            ;;
+        add)
+            [ "$#" -eq 2 ] || return "$EX_USAGE"
+            add_account "$2"
+            ;;
+        login)
+            [ "$#" -ge 2 ] && [ "$#" -le 3 ] || return "$EX_USAGE"
+            case "${3:-}" in
+                '') login_account "$2" ;;
+                --browser) login_account "$2" browser ;;
+                *) die 'usage: codex-switch login N [--browser]' "$EX_USAGE" ;;
+            esac
+            ;;
+        launch)
+            [ "$#" -ge 2 ] || return "$EX_USAGE"
+            shift
+            launch_account "$@"
+            ;;
+        switch|capture|import|status)
+            die 'legacy auth-file switching is disabled; use list, login, or launch' "$EX_USAGE"
+            ;;
+        '')
+            [ "$#" -eq 0 ] || return "$EX_USAGE"
+            menu
+            ;;
+        *)
+            die 'usage: codex-switch [list|add N|login N [--browser]|launch N [--kill] [-- codex-args...]]' "$EX_USAGE"
+            ;;
+    esac
+}
+
+main "$@"
