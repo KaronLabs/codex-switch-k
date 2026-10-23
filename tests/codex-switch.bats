@@ -1518,3 +1518,296 @@ SH
   run "$CODEX_SWITCH" launch 1
   [ "$status" -eq 75 ]
 }
+
+# Opt in only in a disposable privileged Ubuntu container. These use the
+# installed production runner rather than setup()'s copying test double.
+real_runner_setup() {
+  [ -n "${CODEX_SWITCH_REAL_RUNNER:-}" ] || skip 'isolated real runner not configured'
+  init_home 1 alpha
+}
+
+@test "real runner overlays auth and drops uid gid groups without leaking descriptors" {
+  real_runner_setup
+  local expected_groups
+  expected_groups=$(id -G | tr ' ' '\n' | sort -n | tr '\n' ' ')
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_ACCOUNT_ROOT/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" -- /usr/bin/python3 -c '
+import json, os, sys
+assert os.getresuid() == (os.getuid(),) * 3 and os.getuid() != 0
+assert os.getresgid() == (os.getgid(),) * 3
+assert " ".join(map(str, sorted(set(os.getgroups() + [os.getgid()])))) + " " == sys.argv[1]
+assert all(int(n) <= 2 for n in os.listdir("/proc/self/fd") if os.path.exists("/proc/self/fd/" + n))
+path = os.environ["CODEX_HOME"] + "/auth.json"
+assert json.load(open(path))["tokens"]["account_id"] == "acct-alpha-0001"
+with open(path, "w") as stream:
+    stream.write("synthetic-refresh-through-overlay\n")
+' "$expected_groups"
+  [ "$status" -eq 0 ]
+  grep -Fx 'synthetic-refresh-through-overlay' "$CODEX_ACCOUNT_ROOT/1/auth.json"
+  grep -F 'acct-alpha-0001' "$CODEX_SHARED_HOME/auth.json"
+}
+
+@test "real launcher reaches sudo runner and selected synthetic CLI" {
+  real_runner_setup
+  write_auth beta "$CODEX_SHARED_HOME/auth.json"
+  cp "$CODEX_SHARED_HOME/auth.json" "$TEST_ROOT/shared-before"
+  CODEX_BIN="$TEST_ROOT/standalone-version"
+  printf '%s\n' '#!/bin/sh' \
+    'printf "codex-cli synthetic account=%s\\n" "$(jq -r .tokens.account_id "$CODEX_HOME/auth.json")"' >"$CODEX_BIN"
+  chmod 700 "$CODEX_BIN"
+  export CODEX_BIN
+  run env SUDO_BIN=/usr/bin/sudo ADMIN_RUNNER_BIN="$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_SWITCH" launch 1 -- --version
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'codex-cli synthetic account=acct-alpha-0001'* ]]
+  cmp -s "$TEST_ROOT/shared-before" "$CODEX_SHARED_HOME/auth.json"
+}
+
+@test "real runner preserves caller stdin cwd and arguments with spaces" {
+  real_runner_setup
+  printf '%s\n' 'synthetic-input' >"$TEST_ROOT/input"
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_ACCOUNT_ROOT/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" -- /usr/bin/python3 -c '
+import os, sys
+assert sys.stdin.readline() == "synthetic-input\n"
+assert os.getcwd() == sys.argv[1]
+assert sys.argv[2] == "two words"
+' "$PWD" 'two words' <"$TEST_ROOT/input"
+  [ "$status" -eq 0 ]
+}
+
+@test "real runner treats a leading option-shaped source as a literal path" {
+  real_runner_setup
+  cd "$TEST_ROOT"
+  mkdir -m 700 -- '--target=.' '--target=./1' '--target=./1/home'
+  cp -- "$CODEX_ACCOUNT_ROOT/1/auth.json" '--target=./1/auth.json'
+  chmod 600 -- '--target=./1/auth.json'
+  write_auth beta "$CODEX_SHARED_HOME/auth.json"
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    '--target=./1/auth.json' "$CODEX_SHARED_HOME/auth.json" \
+    '--target=./1/home' -- /usr/bin/python3 -c '
+import json, os
+assert json.load(open(os.environ["CODEX_HOME"] + "/auth.json"))["tokens"]["account_id"] == "acct-alpha-0001"
+'
+  [ "$status" -eq 0 ]
+}
+
+@test "real runner preserves command exit status and cannot bypass namespace creation" {
+  real_runner_setup
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_ACCOUNT_ROOT/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" -- /bin/sh -c 'exit 23'
+  [ "$status" -eq 23 ]
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    __inside_private_mount_namespace /etc/passwd /etc/group /tmp -- /bin/true
+  [ "$status" -ne 0 ]
+}
+
+@test "real runner rejects parent symlinks wrong mode and arbitrary file contracts" {
+  real_runner_setup
+  ln -s "$CODEX_ACCOUNT_ROOT" "$TEST_ROOT/alias"
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$TEST_ROOT/alias/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$TEST_ROOT/alias/1/home" -- /bin/true
+  [ "$status" -eq 77 ] || printf 'symlink result: %s\n' "$output" >&3
+  [ "$status" -eq 77 ]
+  cp "$CODEX_SHARED_HOME/auth.json" "$TEST_ROOT/target-before"
+  rm "$CODEX_SHARED_HOME/auth.json"
+  ln -s "$TEST_ROOT/target-before" "$CODEX_SHARED_HOME/auth.json"
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_ACCOUNT_ROOT/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" -- /bin/true
+  [ "$status" -eq 77 ]
+  rm "$CODEX_SHARED_HOME/auth.json"
+  cp "$TEST_ROOT/target-before" "$CODEX_SHARED_HOME/auth.json"
+  chmod 644 "$CODEX_ACCOUNT_ROOT/1/auth.json"
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_ACCOUNT_ROOT/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" -- /bin/true
+  [ "$status" -eq 77 ]
+  chmod 600 "$CODEX_ACCOUNT_ROOT/1/auth.json"
+  cp "$CODEX_ACCOUNT_ROOT/1/auth.json" "$TEST_ROOT/arbitrary"
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$TEST_ROOT/arbitrary" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" -- /bin/true
+  [ "$status" -eq 77 ]
+}
+
+@test "real runner cannot open a caller-owned file behind a root-only ancestor" {
+  real_runner_setup
+  local protected="$TEST_ROOT/protected"
+  /usr/bin/sudo -n /usr/bin/python3 -c '
+import os, shutil, sys
+root, source, uid, gid = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+os.mkdir(root, 0o700)
+os.mkdir(root + "/1", 0o700)
+shutil.copyfile(source, root + "/1/auth.json")
+os.chown(root + "/1/auth.json", uid, gid)
+os.chmod(root + "/1/auth.json", 0o600)
+os.mkdir(root + "/1/home", 0o700)
+os.chown(root + "/1/home", uid, gid)
+' "$protected" "$CODEX_ACCOUNT_ROOT/1/auth.json" "$(id -u)" "$(id -g)"
+  [ ! -r "$protected/1/auth.json" ]
+  run /usr/bin/sudo -n "$CODEX_SWITCH_REAL_RUNNER" \
+    "$protected/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$protected/1/home" -- /bin/true
+  local runner_status=$status
+  /usr/bin/sudo -n /usr/bin/python3 -c 'import shutil, sys; shutil.rmtree(sys.argv[1])' "$protected"
+  [ "$runner_status" -eq 77 ]
+}
+
+run_real_runner_path_swap() {
+  # ptrace changes paths at old mount exec/new open_tree entry, without a
+  # production pause hook or an altered copy of the runner.
+  /usr/bin/sudo -n /usr/bin/python3 - "$CODEX_SWITCH_REAL_RUNNER" \
+    "$CODEX_ACCOUNT_ROOT/1/auth.json" "$CODEX_SHARED_HOME/auth.json" \
+    "$CODEX_ACCOUNT_ROOT/1/home" "$1" <<'PY'
+import ctypes
+import json
+import os
+import platform
+import shutil
+import signal
+import sys
+import tempfile
+
+if platform.machine() != "x86_64":
+    raise SystemExit("ptrace regression requires x86_64 test host")
+libc = ctypes.CDLL(None, use_errno=True)
+libc.ptrace.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+libc.ptrace.restype = ctypes.c_long
+
+def ptrace(request, pid, addr=0, data=0):
+    ctypes.set_errno(0)
+    result = libc.ptrace(request, pid, addr, data)
+    if result == -1 and ctypes.get_errno():
+        raise OSError(ctypes.get_errno(), "ptrace")
+    return result
+
+class Regs(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_ulonglong) for name in
+                "r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rax rcx rdx rsi rdi orig_rax rip cs eflags rsp ss fs_base gs_base ds es fs gs".split()]
+
+def read_string(pid, addr):
+    value = b""
+    for offset in range(0, 256, 8):
+        word = ptrace(2, pid, addr + offset) & ((1 << 64) - 1)
+        value += word.to_bytes(8, "little")
+        if b"\0" in value:
+            return value.split(b"\0", 1)[0]
+    return value
+
+runner, source, target, account_home, mode = sys.argv[1:]
+protected = tempfile.mkdtemp(prefix="runner-protected-")
+os.chmod(protected, 0o755 if mode.startswith("target") else 0o700)
+sentinel = protected + "/auth.json"
+with open(sentinel, "w") as stream:
+    stream.write("synthetic-protected\n")
+os.chmod(sentinel, 0o600 if mode.startswith("target") else 0o644)
+if mode == "target-alias":
+    os.chown(sentinel, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+with open(source, "w") as stream:
+    stream.write("synthetic-selected\n")
+read_fd, write_fd = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(read_fd)
+    os.dup2(write_fd, 1)
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    ptrace(0, 0)
+    os.kill(os.getpid(), signal.SIGSTOP)
+    os.execv(runner, [runner, source, target, account_home, "--", "/usr/bin/cat",
+                     sentinel if mode.startswith("target") else target])
+os.close(write_fd)
+alive = {child}
+swapped = False
+main_rc = None
+try:
+    os.waitpid(child, 0)
+    ptrace(0x4200, child, 0, 1 | 2 | 4 | 8 | 0x40 | 0x100000)
+    ptrace(24, child)
+    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
+    signal.alarm(15)
+    while alive:
+        pid, status = os.waitpid(-1, 0x40000000)
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            alive.discard(pid)
+            if pid == child:
+                main_rc = os.waitstatus_to_exitcode(status)
+            continue
+        stop, event = os.WSTOPSIG(status), status >> 16
+        if event in (1, 2, 3):
+            new_pid = ctypes.c_ulong()
+            ptrace(0x4201, pid, 0, ctypes.byref(new_pid))
+            alive.add(new_pid.value)
+        if stop == (signal.SIGTRAP | 0x80) and not swapped:
+            regs = Regs()
+            ptrace(12, pid, 0, ctypes.byref(regs))
+            entry = regs.rax == ((1 << 64) - 38)
+            old_exec = entry and regs.orig_rax == 59 and read_string(pid, regs.rdi) == b"/usr/bin/mount"
+            if entry and (old_exec or regs.orig_rax == 428):
+                if mode.startswith("target"):
+                    parent = os.path.dirname(target)
+                    os.rename(parent, parent + ".checked")
+                    os.symlink(protected, parent)
+                else:
+                    os.rename(source, source + ".checked")
+                    os.symlink(sentinel, source)
+                swapped = True
+        forwarded = 0 if stop in (signal.SIGSTOP, signal.SIGTRAP, signal.SIGTRAP | 0x80) else stop
+        ptrace(24, pid, 0, forwarded)
+    signal.alarm(0)
+    output = os.read(read_fd, 65536)
+    selected_visible = b"synthetic-selected" in output
+    safe = (not selected_visible and main_rc == 75 if mode == "target"
+            else b"synthetic-protected" not in output and main_rc == (75 if mode == "target-alias" else 0))
+    if mode == "source":
+        safe = safe and selected_visible
+    unchanged = open(sentinel).read() == "synthetic-protected\n"
+    result = {"barrier_reached": swapped, "protected_view_safe": safe,
+              "host_unchanged": unchanged, "selected_visible": selected_visible,
+              "runner_rc": main_rc}
+    print(json.dumps(result))
+    assert swapped and safe and unchanged, result
+finally:
+    signal.alarm(0)
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    os.close(read_fd)
+    shutil.rmtree(protected)
+PY
+}
+
+@test "real runner pins target against a deterministic post-check parent swap" {
+  real_runner_setup
+  run run_real_runner_path_swap target
+  [ "$status" -eq 0 ] || printf 'target result: %s\n' "$output" >&3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"barrier_reached": true'* ]]
+  [[ "$output" == *'"runner_rc": 75'* ]]
+}
+
+@test "real runner pins source against a deterministic post-check symlink swap" {
+  real_runner_setup
+  run run_real_runner_path_swap source
+  [ "$status" -eq 0 ] || printf 'source result: %s\n' "$output" >&3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"barrier_reached": true'* ]]
+  [[ "$output" == *'"selected_visible": true'* ]]
+  [[ "$output" == *'"runner_rc": 0'* ]]
+}
+
+@test "real runner aborts when selected CODEX_HOME path changes after pinning" {
+  real_runner_setup
+  run run_real_runner_path_swap target-alias
+  [ "$status" -eq 0 ] || printf 'target alias result: %s\n' "$output" >&3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'"barrier_reached": true'* ]]
+  [[ "$output" == *'"runner_rc": 75'* ]]
+}

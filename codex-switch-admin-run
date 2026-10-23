@@ -3,63 +3,122 @@ set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-readonly EX_USAGE=64
-readonly EX_NOPERM=77
-
-die() {
-    printf '%s\n' "$1" >&2
-    exit "${2:-1}"
+[[ ${EUID} -eq 0 ]] || { printf '%s\n' 'Codex admin runner must be invoked through sudo' >&2; exit 77; }
+[[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]] || {
+    printf '%s\n' 'sudo caller identity is unavailable' >&2
+    exit 77
 }
 
-safe_user_file() {
-    local path=$1 uid=$2
-    [[ -f "$path" && ! -L "$path" ]] || return 1
-    [[ "$(stat -c '%u:%a' -- "$path" 2>/dev/null)" == "$uid:600" ]]
-}
+# -c leaves stdin available to Codex; -I ignores caller Python configuration.
+code=$(/usr/bin/cat <<'PY'
+import ctypes
+import os
+import pwd
+import stat
+import sys
 
-safe_account_home() {
-    local path=$1 uid=$2
-    [[ -d "$path" && ! -L "$path" ]] || return 1
-    [[ "$(stat -c '%u:%a' -- "$path" 2>/dev/null)" == "$uid:700" ]]
-}
 
-[[ ${EUID} -eq 0 ]] || die 'Codex admin runner must be invoked through sudo' "$EX_NOPERM"
-[[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" ]] || die 'sudo caller identity is unavailable' "$EX_NOPERM"
+def die(message, code=77):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
 
-if [[ ${1:-} != __inside_private_mount_namespace ]]; then
-    exec /usr/bin/unshare --mount --fork --kill-child --propagation private \
-        "$0" __inside_private_mount_namespace "$@"
-fi
-shift
 
-[[ "$(readlink /proc/self/ns/mnt)" != "$(readlink /proc/1/ns/mnt)" ]] || \
-    die 'private mount namespace was not established' "$EX_NOPERM"
-(( $# >= 5 )) || die 'invalid Codex admin runner arguments' "$EX_USAGE"
+if len(sys.argv) < 6 or sys.argv[4] != "--":
+    die("invalid Codex admin runner arguments", 64)
+source, target, account_home = sys.argv[1:4]
+command = sys.argv[5:]
+try:
+    uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+    if uid <= 0 or gid < 0:
+        raise ValueError()
+    caller = pwd.getpwuid(uid)
+    groups = os.getgrouplist(caller.pw_name, gid)
+except (KeyError, ValueError):
+    die("sudo caller identity is unavailable")
 
-auth_source=$1
-auth_target=$2
-account_home=$3
-shift 3
-[[ ${1:-} == -- ]] || die 'invalid Codex admin runner separator' "$EX_USAGE"
-shift
+# Accept the launcher's slot layout with any caller-selected account root.
+slot_dir = os.path.dirname(os.path.normpath(source))
+if (os.path.basename(source) != "auth.json"
+        or not os.path.basename(slot_dir).isdigit()
+        or os.path.basename(slot_dir).startswith("0")
+        or os.path.normpath(account_home) != os.path.join(slot_dir, "home")
+        or os.path.basename(target) != "auth.json"):
+    die("invalid Codex admin runner paths")
 
-safe_user_file "$auth_source" "$SUDO_UID" || die 'selected account auth file is unsafe' "$EX_NOPERM"
-safe_user_file "$auth_target" "$SUDO_UID" || die 'shared auth target is unsafe' "$EX_NOPERM"
-safe_account_home "$account_home" "$SUDO_UID" || die 'selected account home is unsafe' "$EX_NOPERM"
 
-/usr/bin/mount --bind "$auth_source" "$auth_target"
-caller_record=$(getent passwd "$SUDO_UID")
-[[ -n "$caller_record" ]] || die 'sudo caller account is unavailable' "$EX_NOPERM"
-IFS=: read -r caller_name _ _ _ _ caller_home _ <<<"$caller_record"
+def open_path(path):
+    parts = [part for part in path.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        die("unsafe Codex admin runner path")
+    fd = os.open("/" if path.startswith("/") else ".",
+                 os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, part in enumerate(parts):
+            flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+            if index + 1 < len(parts):
+                flags |= os.O_DIRECTORY
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
-exec /usr/bin/setpriv \
-    --reuid="$SUDO_UID" \
-    --regid="$SUDO_GID" \
-    --init-groups \
-    /usr/bin/env \
-    HOME="$caller_home" \
-    USER="$caller_name" \
-    LOGNAME="$caller_name" \
-    CODEX_HOME="$(dirname "$auth_target")" \
-    CODEX_SWITCH_ACCOUNT_HOME="$account_home" \
-    "$@"
+
+def check(fd, kind, mode, uid):
+    item = os.fstat(fd)
+    if (not kind(item.st_mode) or item.st_uid != uid
+            or stat.S_IMODE(item.st_mode) != mode):
+        die("selected account file or home is unsafe")
+
+
+try:
+    try:
+        # Traverse as the caller, retaining saved root IDs for the mount.
+        os.setgroups(groups)
+        os.setresgid(gid, gid, 0)
+        os.setresuid(uid, uid, 0)
+        try:
+            source_fd = open_path(source)
+            target_fd = open_path(target)
+            home_fd = open_path(account_home)
+        finally:
+            os.setresuid(0, 0, 0)
+            os.setresgid(0, 0, 0)
+    except OSError:
+        die("selected account file or home is unsafe")
+    check(source_fd, stat.S_ISREG, 0o600, uid)
+    check(target_fd, stat.S_ISREG, 0o600, uid)
+    check(home_fd, stat.S_ISDIR, 0o700, uid)
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.open_tree.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    libc.open_tree.restype = ctypes.c_int
+    libc.move_mount.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                                ctypes.c_char_p, ctypes.c_uint)
+    libc.move_mount.restype = ctypes.c_int
+    tree_fd = libc.open_tree(source_fd, b"", 0x1000 | 1 | os.O_CLOEXEC)
+    if tree_fd < 0:
+        raise OSError(ctypes.get_errno(), "open_tree")
+    if libc.move_mount(tree_fd, b"", target_fd, b"", 0x04 | 0x40) < 0:
+        raise OSError(ctypes.get_errno(), "move_mount")
+    selected, visible = os.fstat(source_fd), os.stat(target)
+    if (selected.st_dev, selected.st_ino) != (visible.st_dev, visible.st_ino):
+        die("selected account mount target changed", 75)
+    for fd in (tree_fd, source_fd, target_fd, home_fd):
+        os.close(fd)
+
+    os.setresgid(gid, gid, gid)
+    os.setresuid(uid, uid, uid)
+    environment = os.environ.copy()
+    environment.update(HOME=caller.pw_dir, USER=caller.pw_name,
+                       LOGNAME=caller.pw_name, CODEX_HOME=os.path.dirname(target),
+                       CODEX_SWITCH_ACCOUNT_HOME=account_home)
+    os.execvpe(command[0], command, environment)
+except OSError:
+    die("Codex admin runner could not safely mount or execute", 75)
+PY
+)
+exec /usr/bin/unshare --mount --fork --kill-child --propagation private \
+    /usr/bin/python3 -I -c "$code" "$@"

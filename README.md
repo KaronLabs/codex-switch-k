@@ -58,7 +58,7 @@ sudo visudo -cf /etc/sudoers.d/codex-switch-k
 sudo stat -c '%U:%G %a %n' /usr/local/libexec/codex-switch-admin-run
 ```
 
-The runner must be owned by `root:root`; the sudoers check must say the file parses. The launcher uses `sudo -n` without `-E`, so a missing or denied rule stops launch instead of falling back to an unisolated account.
+The runner must be owned by `root:root`; the sudoers check must say the file parses. The launcher uses `sudo -n` without `-E`, so a missing or denied rule stops launch instead of falling back to an unisolated account. The runner traverses authentication paths with the caller's permissions, pins the selected file and shared mount target with file descriptors, and binds those objects using Linux `open_tree` and `move_mount`. It checks that the selected file remains visible at `CODEX_HOME` before running Codex. It fails closed if either syscall is unavailable or denied. This requires Linux 5.2+ and glibc 2.36+ (Ubuntu 24.04 satisfies both). Do not use the older pathname-based runner with this sudoers rule.
 
 ## Create slots and sign in
 
