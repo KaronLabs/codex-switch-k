@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(git rev-parse --show-toplevel) || exit 2
+cd -- "$repo"
+
+if python3 --version >/dev/null 2>&1; then
+  python_bin=python3
+elif python --version >/dev/null 2>&1; then
+  python_bin=python
+else
+  echo 'pre-push: Python is required' >&2
+  exit 2
+fi
+
+if ! "$python_bin" scripts/check_public_history.py >/dev/null 2>&1; then
+  echo 'pre-push: public Git history path check failed' >&2
+  exit 1
+fi
+
+if [[ -n ${GITLEAKS_BIN:-} ]]; then
+  scanner=$GITLEAKS_BIN
+elif [[ -x .githooks/tools/gitleaks ]]; then
+  scanner=.githooks/tools/gitleaks
+elif [[ -x .githooks/tools/gitleaks.exe ]]; then
+  scanner=.githooks/tools/gitleaks.exe
+elif command -v gitleaks >/dev/null 2>&1; then
+  scanner=$(command -v gitleaks)
+else
+  echo 'pre-push: Gitleaks 8.30.1 is required' >&2
+  exit 2
+fi
+
+if [[ $("$scanner" version 2>/dev/null || true) != 8.30.1 ]]; then
+  echo 'pre-push: expected Gitleaks 8.30.1' >&2
+  exit 2
+fi
+
+if ! "$scanner" git . \
+  --log-opts='--all --full-history --diff-merges=first-parent' \
+  --redact=100 --max-archive-depth=2 --ignore-gitleaks-allow --no-banner \
+  >/dev/null 2>&1; then
+  echo 'pre-push: Gitleaks found a secret or could not scan; push blocked' >&2
+  exit 1
+fi
+
+echo 'pre-push: public history and Gitleaks checks passed' >&2
