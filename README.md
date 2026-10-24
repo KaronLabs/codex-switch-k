@@ -101,6 +101,25 @@ python3 -m unittest discover -s tests -p 'test_*.py' -q
 
 Pull requests and pushes to `main` run these checks in CI, including the synthetic real-runner Bats cases on an ephemeral Ubuntu 24.04 runner. A separate job checks prohibited paths across Git history and scans the fetched history with Gitleaks; neither job signs in to OpenAI or makes a model request.
 
+### Check before a public push
+
+The optional local pre-push hook checks all local Git history paths and runs the same Gitleaks 8.30.1 history scan as CI. It rejects pushed commits outside local refs, annotated tags, and local Gitleaks configuration overrides that this scan cannot cover. Install [Gitleaks 8.30.1](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1) on `PATH`, or put its executable in the ignored `.githooks/tools/` directory as `gitleaks` (Linux) or `gitleaks.exe` (Windows). Verify the downloaded archive SHA-256 before extracting it: Linux x64 `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb`; Windows x64 `d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e`. The hook refuses a missing or different version and suppresses scanner output so a suspected secret is not copied into terminal logs.
+
+Enable the hook in **each clone** from its repository root:
+
+```bash
+git config --local core.hooksPath .githooks
+bash .githooks/pre-push
+```
+
+The second command should report that both checks passed. Git does not activate tracked hooks automatically, and `git push --no-verify` can bypass a local hook. Protected `main` still requires the server-side `secrets` and `tests` checks.
+
+### Maintain publication guards
+
+After changing GitHub branch settings, run `python3 scripts/check_main_protection.py` with a GitHub CLI login that can read repository protection. It compares the exact required check names `secrets` and `tests`, their GitHub Actions app ID `15368`, strict status checks, administrator enforcement, PR reviews with no bypass actors, and force-push/deletion denial. A mismatch or failed API read exits nonzero. On Windows, use `python` if `python3` is unavailable. The check is read-only and does not require a new repository secret.
+
+CI also runs weekly on Monday at 03:17 UTC and can be started from the Actions tab or with `gh workflow run ci.yml --ref main`. Run it manually after changing the Ubuntu runner image. Its `Probe Bubblewrap namespace support` step must pass, followed by the real-runner Bats tests. When updating Gitleaks, update its pinned download and checksum together and keep all three synthetic history canaries: deleted secret, merge-resolution secret, and regular-file-to-symlink secret. Confirm the `secrets` job passes all three on the new scanner before merging. GitHub may delay scheduled workflows or disable them after 60 days of public-repository inactivity, so use manual dispatch for an immediate image check.
+
 For updates, stop Codex sessions, inspect `git status`, and run `git pull --ff-only`. From the repository root, back up the installed files and replace only these two paths:
 
 ```bash
