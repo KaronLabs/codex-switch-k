@@ -92,11 +92,14 @@ Use `cod` for the menu, `cod list` for status, or `cod-l 1` to start slot 1. The
 Tests use synthetic credentials and a fake CLI; they make no OpenAI model request:
 
 ```bash
-bash -n codex-switch codex-switch-admin-run
+bash -n codex-switch
+bash -n codex-switch-admin-run
 shellcheck codex-switch codex-switch-admin-run
 bats tests/codex-switch.bats
 python3 -m unittest discover -s tests -p 'test_*.py' -q
 ```
+
+Pull requests and pushes to `main` run these checks in CI, including the synthetic real-runner Bats cases on an ephemeral Ubuntu 24.04 runner. A separate job checks prohibited paths across Git history and scans the fetched history with Gitleaks; neither job signs in to OpenAI or makes a model request.
 
 For updates, stop Codex sessions, inspect `git status`, and run `git pull --ff-only`. From the repository root, back up the installed files and replace only these two paths:
 
