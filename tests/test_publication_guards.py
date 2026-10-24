@@ -42,7 +42,8 @@ class PrePushTests(unittest.TestCase):
         (self.repo / "README.md").write_text("ordinary test data\n", encoding="utf-8")
         git(self.repo, "add", "README.md", "scripts/check_public_history.py")
         git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base")
-        self.scanner = self.repo / ".fake-gitleaks.sh"
+        self.scanner = self.repo / ".githooks" / "tools" / "gitleaks"
+        self.scanner.parent.mkdir()
         self.scanner.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = version ]; then echo \"${FAKE_VERSION:-8.30.1}\"; exit 0; fi\n"
@@ -56,7 +57,7 @@ class PrePushTests(unittest.TestCase):
     def hook(self, **changes):
         bash = shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
         env = os.environ.copy()
-        env.update({"GITLEAKS_BIN": "./.fake-gitleaks.sh", "SCAN_ARGS": "./.scan-args"})
+        env.update({"SCAN_ARGS": "./.scan-args"})
         env.update(changes)
         return subprocess.run([bash, ".githooks/pre-push"], cwd=self.repo, env=env, capture_output=True, text=True)
 
@@ -75,7 +76,10 @@ class PrePushTests(unittest.TestCase):
         self.assertNotIn("ghp_fixture_must_not_be_echoed", result.stdout + result.stderr)
 
     def test_missing_scanner_blocks_push(self):
-        result = self.hook(GITLEAKS_BIN="./missing")
+        if shutil.which("gitleaks"):
+            self.skipTest("system Gitleaks is available")
+        self.scanner.unlink()
+        result = self.hook()
         self.assertNotEqual(result.returncode, 0)
 
     def test_wrong_scanner_version_blocks_push(self):
@@ -97,7 +101,7 @@ class PrePushTests(unittest.TestCase):
         git(remote, "init", "--bare", "-q")
         git(self.repo, "config", "--local", "core.hooksPath", ".githooks")
         env = os.environ.copy()
-        env.update({"GITLEAKS_BIN": "./.fake-gitleaks.sh", "SCAN_ARGS": "./.scan-args"})
+        env.update({"SCAN_ARGS": "./.scan-args"})
         result = subprocess.run(
             ["git", "-C", str(self.repo), "push", str(remote), "HEAD:main"],
             env=env, capture_output=True, text=True,
@@ -112,7 +116,7 @@ class PrePushTests(unittest.TestCase):
         git(remote, "init", "--bare", "-q")
         git(self.repo, "config", "--local", "core.hooksPath", ".githooks")
         env = os.environ.copy()
-        env.update({"GITLEAKS_BIN": "./.fake-gitleaks.sh", "SCAN_ARGS": "./.scan-args", "SCAN_EXIT": "1"})
+        env.update({"SCAN_ARGS": "./.scan-args", "SCAN_EXIT": "1"})
         result = subprocess.run(
             ["git", "-C", str(self.repo), "push", str(remote), "HEAD:main"],
             env=env, capture_output=True, text=True,
@@ -124,6 +128,46 @@ class PrePushTests(unittest.TestCase):
         )
         self.assertNotEqual(remote_ref.returncode, 0)
         self.assertNotIn("ghp_fixture_must_not_be_echoed", result.stdout + result.stderr)
+
+    def test_git_push_rejects_commit_outside_local_refs(self):
+        (self.repo / "orphan.txt").write_text("synthetic only\n", encoding="utf-8")
+        git(self.repo, "add", "orphan.txt")
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "orphan")
+        orphan = git(self.repo, "rev-parse", "HEAD").strip()
+        git(self.repo, "reset", "--hard", "HEAD^")
+        remote = Path(self.temp.name) / "remote.git"
+        remote.mkdir()
+        git(remote, "init", "--bare", "-q")
+        git(self.repo, "config", "--local", "core.hooksPath", ".githooks")
+        env = os.environ.copy()
+        env.update({"SCAN_ARGS": "./.scan-args"})
+        result = subprocess.run(
+            ["git", "-C", str(self.repo), "push", str(remote), f"{orphan}:refs/heads/leak"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_git_push_rejects_annotated_tag(self):
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "tag", "-a", "fixture", "-m", "synthetic tag message")
+        remote = Path(self.temp.name) / "remote.git"
+        remote.mkdir()
+        git(remote, "init", "--bare", "-q")
+        git(self.repo, "config", "--local", "core.hooksPath", ".githooks")
+        env = os.environ.copy()
+        env.update({"SCAN_ARGS": "./.scan-args"})
+        result = subprocess.run(
+            ["git", "-C", str(self.repo), "push", str(remote), "refs/tags/fixture:refs/tags/fixture"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_scanner_configuration_overrides_block_push(self):
+        (self.repo / ".gitleaks.toml").write_text("synthetic only\n", encoding="utf-8")
+        self.assertNotEqual(self.hook().returncode, 0)
+        (self.repo / ".gitleaks.toml").unlink()
+        self.assertNotEqual(self.hook(GITLEAKS_CONFIG_TOML="[rules]").returncode, 0)
+        self.assertNotEqual(self.hook(GITLEAKS_CONFIG="./fake-config").returncode, 0)
+        self.assertNotEqual(self.hook(GITLEAKS_BIN="./fake-scanner").returncode, 0)
 
 
 class ProtectionTests(unittest.TestCase):

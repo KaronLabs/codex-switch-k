@@ -103,7 +103,7 @@ Pull requests and pushes to `main` run these checks in CI, including the synthet
 
 ### Check before a public push
 
-The optional local pre-push hook checks all local Git history paths and runs the same Gitleaks 8.30.1 history scan as CI. Install [Gitleaks 8.30.1](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1) on `PATH`, or put its executable in the ignored `.githooks/tools/` directory as `gitleaks` (Linux) or `gitleaks.exe` (Windows). Verify the downloaded archive SHA-256 before extracting it: Linux x64 `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb`; Windows x64 `d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e`. The hook refuses a missing or different version and suppresses scanner output so a suspected secret is not copied into terminal logs.
+The optional local pre-push hook checks all local Git history paths and runs the same Gitleaks 8.30.1 history scan as CI. It rejects pushed commits outside local refs, annotated tags, and local Gitleaks configuration overrides that this scan cannot cover. Install [Gitleaks 8.30.1](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1) on `PATH`, or put its executable in the ignored `.githooks/tools/` directory as `gitleaks` (Linux) or `gitleaks.exe` (Windows). Verify the downloaded archive SHA-256 before extracting it: Linux x64 `551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb`; Windows x64 `d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e`. The hook refuses a missing or different version and suppresses scanner output so a suspected secret is not copied into terminal logs.
 
 Enable the hook in **each clone** from its repository root:
 
