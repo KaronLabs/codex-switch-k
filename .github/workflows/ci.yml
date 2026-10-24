@@ -32,6 +32,17 @@ jobs:
         run: shellcheck -f gcc codex-switch codex-switch-admin-run
       - name: Python unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+      - name: Probe Bubblewrap namespace support
+        run: |
+          for name in unprivileged_userns_clone apparmor_restrict_unprivileged_userns; do
+            path="/proc/sys/kernel/$name"
+            if test -r "$path"; then
+              printf '%s=%s\n' "$name" "$(cat "$path")"
+            else
+              printf '%s=unavailable\n' "$name"
+            fi
+          done
+          bwrap --bind / / --dev-bind /dev /dev -- /usr/bin/true
       - name: Bats including real runner
         run: |
           sudo install -d -m 755 /usr/local/libexec
