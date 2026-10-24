@@ -106,6 +106,25 @@ class PrePushTests(unittest.TestCase):
         self.assertTrue((self.repo / ".scan-args").exists())
         self.assertIn("pre-push: public history and Gitleaks checks passed", result.stderr)
 
+    def test_git_push_rejects_scanner_finding(self):
+        remote = Path(self.temp.name) / "remote.git"
+        remote.mkdir()
+        git(remote, "init", "--bare", "-q")
+        git(self.repo, "config", "--local", "core.hooksPath", ".githooks")
+        env = os.environ.copy()
+        env.update({"GITLEAKS_BIN": "./.fake-gitleaks.sh", "SCAN_ARGS": "./.scan-args", "SCAN_EXIT": "1"})
+        result = subprocess.run(
+            ["git", "-C", str(self.repo), "push", str(remote), "HEAD:main"],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        remote_ref = subprocess.run(
+            ["git", "-C", str(remote), "show-ref", "--verify", "--quiet", "refs/heads/main"],
+            capture_output=True,
+        )
+        self.assertNotEqual(remote_ref.returncode, 0)
+        self.assertNotIn("ghp_fixture_must_not_be_echoed", result.stdout + result.stderr)
+
 
 class ProtectionTests(unittest.TestCase):
     @classmethod
@@ -150,6 +169,12 @@ class ProtectionTests(unittest.TestCase):
         payload = self.protection()
         payload["required_pull_request_reviews"]["required_approving_review_count"] = 1
         self.assertTrue(self.module.assess(payload))
+
+    def test_pull_request_bypass_drift_fails(self):
+        for kind in ("users", "teams", "apps"):
+            payload = self.protection()
+            payload["required_pull_request_reviews"]["bypass_pull_request_allowances"] = {kind: ["actor"]}
+            self.assertTrue(self.module.assess(payload), kind)
 
     def test_cli_distinguishes_pass_drift_and_failed_read(self):
         for payload, expected in ((self.protection(), 0), ({}, 1)):

@@ -26,6 +26,9 @@ def assess(protection):
     reviews = protection.get("required_pull_request_reviews") or {}
     if reviews.get("required_approving_review_count") != 0:
         drift.append("required_pull_request_reviews")
+    bypass = reviews.get("bypass_pull_request_allowances") or {}
+    if not isinstance(bypass, dict) or any(bypass.values()):
+        drift.append("required_pull_request_reviews.bypass_pull_request_allowances")
     for name in ("allow_force_pushes", "allow_deletions"):
         if (protection.get(name) or {}).get("enabled") is not False:
             drift.append(name)
