@@ -1,0 +1,215 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    needs: secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats shellcheck bubblewrap jq apparmor-profiles apparmor-utils
+      - name: Load Bubblewrap AppArmor profile
+        run: |
+          if ! bwrap --bind / / --dev-bind /dev /dev -- /usr/bin/true >/dev/null 2>&1; then
+            if test -e /etc/apparmor.d/bwrap-userns-restrict || test -L /etc/apparmor.d/bwrap-userns-restrict; then
+              echo 'Bubblewrap needs a profile, but the AppArmor profile path already exists' >&2
+              exit 1
+            fi
+            sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+            sudo apparmor_parser -a /etc/apparmor.d/bwrap-userns-restrict
+          fi
+      - name: Bash syntax
+        run: |
+          bash -n codex-switch
+          bash -n codex-switch-admin-run
+      - name: ShellCheck
+        run: shellcheck -f gcc codex-switch codex-switch-admin-run
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+      - name: Probe Bubblewrap namespace support
+        run: |
+          for name in unprivileged_userns_clone apparmor_restrict_unprivileged_userns; do
+            path="/proc/sys/kernel/$name"
+            if test -r "$path"; then
+              printf '%s=%s\n' "$name" "$(cat "$path")"
+            else
+              printf '%s=unavailable\n' "$name"
+            fi
+          done
+          bwrap --bind / / --dev-bind /dev /dev -- /usr/bin/true
+      - name: Bats including real runner
+        run: |
+          sudo install -d -m 755 /usr/local/libexec
+          sudo install -o root -g root -m 755 codex-switch-admin-run /usr/local/libexec/codex-switch-admin-run
+          CODEX_SWITCH_REAL_RUNNER=/usr/local/libexec/codex-switch-admin-run bats tests/codex-switch.bats
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install verified Gitleaks
+        run: |
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl -fsSLo "$archive" https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          printf '%s  %s\n' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' "$archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Check public Git history paths
+        run: python3 scripts/check_public_history.py
+      - name: Prove deleted synthetic canary is detected
+        run: |
+          set -euo pipefail
+          canary_repo=$(mktemp -d)
+          trap 'rm -rf "$canary_repo"' EXIT
+          git -C "$canary_repo" init -q
+          git -C "$canary_repo" config user.name 'CI Canary'
+          git -C "$canary_repo" config user.email 'canary@example.invalid'
+          python3 - "$canary_repo/canary.txt" <<'PY'
+          import secrets
+          import string
+          import sys
+
+          alphabet = string.ascii_letters + string.digits
+          token = 'ghp_' + ''.join(secrets.choice(alphabet) for _ in range(36))
+          with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+              stream.write(token + '\n')
+          PY
+          git -C "$canary_repo" add canary.txt
+          git -C "$canary_repo" commit -qm 'add synthetic canary'
+          git -C "$canary_repo" rm -q canary.txt
+          git -C "$canary_repo" commit -qm 'delete synthetic canary'
+          test ! -e "$canary_repo/canary.txt"
+          if "$RUNNER_TEMP/gitleaks" git "$canary_repo" --log-opts='--all --full-history --diff-merges=first-parent' --redact=100 --max-archive-depth=2 --ignore-gitleaks-allow --no-banner --report-format=json --report-path="$canary_repo/findings.json" >"$canary_repo/scan.log" 2>&1; then
+            echo 'Gitleaks missed the deleted synthetic canary' >&2
+            exit 1
+          else
+            status=$?
+          fi
+          test "$status" -eq 1
+          python3 - "$canary_repo/findings.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              findings = json.load(stream)
+          if not any(item.get('File') == 'canary.txt' for item in findings):
+              raise SystemExit('Gitleaks did not report the historical canary')
+          PY
+      - name: Prove merge-only synthetic canary is detected
+        run: |
+          set -euo pipefail
+          canary_repo=$(mktemp -d)
+          trap 'rm -rf "$canary_repo"' EXIT
+          git -C "$canary_repo" init -q -b main
+          git -C "$canary_repo" config user.name 'CI Canary'
+          git -C "$canary_repo" config user.email 'canary@example.invalid'
+          printf 'base\n' >"$canary_repo/canary.txt"
+          git -C "$canary_repo" add canary.txt
+          git -C "$canary_repo" commit -qm base
+          git -C "$canary_repo" switch -qc feature
+          printf 'feature\n' >"$canary_repo/canary.txt"
+          git -C "$canary_repo" commit -qam feature
+          git -C "$canary_repo" switch -q main
+          printf 'main\n' >"$canary_repo/canary.txt"
+          git -C "$canary_repo" commit -qam main
+          if git -C "$canary_repo" merge --no-ff feature >"$canary_repo/merge.log" 2>&1; then
+            echo 'Expected a conflict for the synthetic merge canary' >&2
+            exit 1
+          fi
+          test -f "$canary_repo/.git/MERGE_HEAD"
+          python3 - "$canary_repo/canary.txt" <<'PY'
+          import secrets
+          import string
+          import sys
+
+          alphabet = string.ascii_letters + string.digits
+          token = 'ghp_' + ''.join(secrets.choice(alphabet) for _ in range(36))
+          with open(sys.argv[1], 'w', encoding='utf-8') as stream:
+              stream.write(token + '\n')
+          PY
+          git -C "$canary_repo" add canary.txt
+          git -C "$canary_repo" commit -qm 'resolve synthetic conflict'
+          git -C "$canary_repo" rev-parse HEAD^2 >/dev/null
+          if "$RUNNER_TEMP/gitleaks" git "$canary_repo" --log-opts='--all --full-history --diff-merges=first-parent' --redact=100 --max-archive-depth=2 --ignore-gitleaks-allow --no-banner --report-format=json --report-path="$canary_repo/findings.json" >"$canary_repo/scan.log" 2>&1; then
+            echo 'Gitleaks missed the merge-only synthetic canary' >&2
+            exit 1
+          else
+            status=$?
+          fi
+          test "$status" -eq 1
+          python3 - "$canary_repo/findings.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              findings = json.load(stream)
+          if not any(item.get('File') == 'canary.txt' for item in findings):
+              raise SystemExit('Gitleaks did not report the merge canary')
+          PY
+      - name: Prove symlink type-change synthetic canary is detected
+        run: |
+          set -euo pipefail
+          canary_repo=$(mktemp -d)
+          trap 'rm -rf "$canary_repo"' EXIT
+          git -C "$canary_repo" init -q
+          git -C "$canary_repo" config user.name 'CI Canary'
+          git -C "$canary_repo" config user.email 'canary@example.invalid'
+          printf 'ordinary\n' >"$canary_repo/canary.txt"
+          git -C "$canary_repo" add canary.txt
+          git -C "$canary_repo" commit -qm 'add ordinary canary file'
+          python3 - "$canary_repo/canary.txt" <<'PY'
+          import os
+          import secrets
+          import string
+          import sys
+
+          path = sys.argv[1]
+          os.unlink(path)
+          alphabet = string.ascii_letters + string.digits
+          token = 'ghp_' + ''.join(secrets.choice(alphabet) for _ in range(36))
+          os.symlink(token, path)
+          PY
+          test -L "$canary_repo/canary.txt"
+          test ! -e "$canary_repo/canary.txt"
+          git -C "$canary_repo" add canary.txt
+          git -C "$canary_repo" commit -qm 'change canary file to symlink'
+          test "$(git -C "$canary_repo" diff --name-only --diff-filter=T HEAD^ HEAD -- canary.txt)" = canary.txt
+          if "$RUNNER_TEMP/gitleaks" git "$canary_repo" --log-opts='--all --full-history --diff-merges=first-parent' --redact=100 --max-archive-depth=2 --ignore-gitleaks-allow --no-banner --report-format=json --report-path="$canary_repo/findings.json" >"$canary_repo/scan.log" 2>&1; then
+            echo 'Gitleaks missed the synthetic symlink canary' >&2
+            exit 1
+          else
+            status=$?
+          fi
+          test "$status" -eq 1
+          python3 - "$canary_repo/findings.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding='utf-8') as stream:
+              findings = json.load(stream)
+          if not any(item.get('File') == 'canary.txt' for item in findings):
+              raise SystemExit('Gitleaks did not report the symlink canary')
+          PY
+      - name: Scan full Git history
+        run: |
+          "$RUNNER_TEMP/gitleaks" git . --log-opts='--all --full-history --diff-merges=first-parent' --redact=100 --max-archive-depth=2 --ignore-gitleaks-allow --no-banner
