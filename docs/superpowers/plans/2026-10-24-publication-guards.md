@@ -45,7 +45,7 @@
 
 - [ ] Record the RED baseline: no workflow and no Actions checks at the current public HEAD.
 - [ ] Add `tests` and `secrets` jobs on pull requests and pushes to `main`, without path filters.
-- [ ] Run Bash/ShellCheck/Python/Bats in `tests`; configure the synthetic real runner so all Bats cases execute.
+- [ ] Run Bash/ShellCheck/Python/Bats in `tests`; load the Ubuntu-packaged Bubblewrap AppArmor profile on the ephemeral runner, functionally probe unprivileged Bubblewrap, and configure the synthetic real runner so all Bats cases execute.
 - [ ] In `secrets`, verify the pinned Gitleaks download, run the history path policy, prove deleted, merge-only and file-to-symlink disposable synthetic canaries are detected, then scan full checkout history including type changes and merge diffs, with redaction and archive depth 2.
 - [ ] Validate workflow syntax locally and require the first PR run to pass before changing branch protection.
 

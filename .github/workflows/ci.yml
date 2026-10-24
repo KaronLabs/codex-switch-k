@@ -23,7 +23,17 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bats shellcheck bubblewrap jq
+          sudo apt-get install -y bats shellcheck bubblewrap jq apparmor-profiles apparmor-utils
+      - name: Load Bubblewrap AppArmor profile
+        run: |
+          if ! bwrap --bind / / --dev-bind /dev /dev -- /usr/bin/true >/dev/null 2>&1; then
+            if test -e /etc/apparmor.d/bwrap-userns-restrict || test -L /etc/apparmor.d/bwrap-userns-restrict; then
+              echo 'Bubblewrap needs a profile, but the AppArmor profile path already exists' >&2
+              exit 1
+            fi
+            sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+            sudo apparmor_parser -a /etc/apparmor.d/bwrap-userns-restrict
+          fi
       - name: Bash syntax
         run: |
           bash -n codex-switch
